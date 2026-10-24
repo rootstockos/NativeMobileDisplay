@@ -6,6 +6,8 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOTimerEventSource.h>
+#include <kern/clock.h>
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
 #include <libkern/c++/OSData.h>
@@ -40,6 +42,18 @@ extern "C" void native_legacy_gpu_fallback_observed(int status);
 // kIOReturnNotPrivileged.
 extern "C" IOReturn uke_original_default_surface_port(void *,task_t,uint32_t *);
 extern "C" IOReturn uke_surface_copy_port_name(void *,task_t,void *,uint32_t *);
+// Swaps retired when the GPU client took the frame (before its copy finished), and copies that then failed after such a retirement.
+extern "C" {volatile uint64_t native_legacy_early_retires,native_legacy_early_failures;}
+// Display refresh tick (boot-arg sheng-vsync=<Hz>, 0 or absent: off). The original family sends the compositor's vsync message (type 5)
+// through native_legacy_vsync_notify, the unchanged original sender, but only a platform subclass calls it from the panel's vblank and
+// that subclass is not part of this port: without it the render server never saw a vsync. The GOP scanout has no vblank interrupt, so a
+// work-loop timer stands in for it while at least one client has vsync notifications enabled. Events: 0 armed, 1 sent, 2 idle (no client),
+// 3 late (deadline passed, cadence restarted), 4 started, 5 refresh properties reported at that rate.
+extern "C" void native_legacy_vsync_notify(void *display,uint64_t timestamp,uint64_t continuousTime,uint64_t interval);
+// The unchanged original setDisplayRefreshProperties: publishes IOMFBDisplayRefresh from slot 301 (getRefreshAttributes below).
+extern "C" bool native_legacy_set_refresh_properties(void *display);
+extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
+extern "C" uint64_t mach_continuous_time(void);
 // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
 // either way (no compression is implemented), so the bytes are the same.
 static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -71,6 +85,57 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
     uint64_t gpuLength=0;
     bool gpuBypass=false;
+    // The swap of the frame the GPU client is copying already retired (boot-arg sheng-early-retire, default 1).
+    bool gpuRetired=false;
+    // The refresh tick runs on the family's work loop, the loop of the command gate that registers and removes the vsync clients, so the
+    // client queue at +5592 never changes while the sender walks it.
+    IOTimerEventSource *vsyncTimer=nullptr;
+    uint64_t vsyncInterval=0,vsyncNext=0;
+    unsigned vsyncHz=0;
+    bool vsyncArmed=false;
+    bool vsyncWanted() const {
+        const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5592,sizeof(head));return head;
+    }
+    // Selector 72's registration of a vsync client ends in kickSwapQueue (slot 290), which arms the tick; the tick stops by itself once
+    // the last client is removed.
+    void armVsync() {
+        if(!vsyncTimer || vsyncArmed || !vsyncWanted())return;
+        vsyncArmed=true;vsyncNext=mach_absolute_time()+vsyncInterval;
+        vsyncTimer->wakeAtTime(vsyncNext);native_legacy_vsync_observed(0,vsyncHz);
+    }
+    static void vsyncFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->vsyncTick();}
+    void vsyncTick() {
+        vsyncArmed=false;
+        if(!vsyncTimer)return;
+        if(!vsyncWanted()){native_legacy_vsync_observed(2,vsyncHz);return;}
+        const uint64_t now=mach_absolute_time();
+        native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
+        native_legacy_vsync_observed(1,vsyncHz);
+        vsyncNext+=vsyncInterval;
+        if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
+        vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
+    }
+    void startVsync() {
+        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        if(!hz || hz>240 || !primary || !bootMapping || vsyncTimer)return;
+        IOWorkLoop *loop=getWorkLoop();
+        if(!loop)return;
+        IOTimerEventSource *timer=IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::vsyncFired);
+        if(!timer)return;
+        if(loop->addEventSource(timer)!=kIOReturnSuccess){timer->release();return;}
+        nanoseconds_to_absolutetime(1000000000ull/hz,&vsyncInterval);
+        vsyncHz=hz;vsyncTimer=timer;native_legacy_vsync_observed(4,hz);
+        // A client may already have registered: arm under the gate, like the registration does.
+        loop->runAction([](OSObject *owner,void *,void *,void *,void *)->IOReturn {
+            static_cast<NativeLegacyDisplay *>(owner)->armVsync();return kIOReturnSuccess;
+        },this);
+    }
+    void stopVsync() {
+        if(!vsyncTimer)return;
+        vsyncTimer->cancelTimeout();
+        if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(vsyncTimer);
+        OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
+    }
 public:
     // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
     void gpuComplete(int status) {
@@ -81,9 +146,10 @@ public:
         };
         if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
     }
-    void free() override {if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+    void free() override {stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
-        transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;
+        stopVsync();
+        transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
     }
@@ -98,6 +164,10 @@ public:
         setter(this,&request,false);
     }
     bool start(IOService *provider) override {
+        if(!startDisplay(provider))return false;
+        startVsync();return true;
+    }
+    bool startDisplay(IOService *provider) {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
         if(primary && bootMapping)announcePoweredByFirmware();
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
@@ -135,14 +205,36 @@ public:
     void registerService(IOOptionBits options=0) override {
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
         if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
+        // Nothing in the family publishes IOMFBDisplayRefresh (its platform subclass does), and without it the render server keeps its own
+        // 1/60 s heartbeat (int-210: refresh=0). Publish it before any client can find the display, only when sheng-vsync asks for more.
+        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        if(primary && hz>60 && hz<=240)native_legacy_set_refresh_properties(this);
         IOService::registerService(options);native_legacy_registration_observed(this);
     }
     bool isMainDisplay() override {return primary;}
+    // The render server paces its display timer by the minimum refresh interval in IOMFBDisplayRefresh (int-209: no vsync client ever
+    // registered, frames came every 16.7 ms), and the generic slot 301 fixes it at 1/60 s. With sheng-vsync=<Hz> it reports the panel's
+    // own rate instead; the maximum interval and the step keep the original values. Words in 32.32 seconds, then their mach times.
+    // The original maximum interval is 1/24 s (int-240), which offers the render server a 24 to sheng-vsync Hz range. The panel has no
+    // variable refresh, so sheng-vsync-fixed=1 reports the maximum interval equal to the minimum: one fixed rate.
+    bool getRefreshAttributes(uint64_t *words,bool fixed) override {
+        if(!IOMobileFramebufferLegacy::getRefreshAttributes(words,fixed) || !words)return false;
+        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        if(hz<=60 || hz>240)return true;
+        unsigned locked=0;PE_parse_boot_argn("sheng-vsync-fixed",&locked,sizeof(locked));
+        const uint64_t interval=(1ull<<32)/hz;
+        uint64_t machTime=0;nanoseconds_to_absolutetime(interval*1000000000ull>>32,&machTime);
+        words[0]=interval;words[1]=machTime;
+        if(fixed || locked==1){words[2]=interval;words[3]=machTime;}
+        native_legacy_vsync_observed(5,hz);
+        return true;
+    }
     // A swap the client submitted while the previous one was still on its way (transferred) is not kicked by the family again: without the
     // re-kick after each retirement it waited for the next submission (int-143: every offer came one frame late, a still screen showed the
     // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
     bool kicking=false,rekick=false;
     void kickSwapQueue() override {
+        armVsync();
         if(kicking){rekick=true;return;}
         kicking=true;
         do {
@@ -227,7 +319,16 @@ public:
         if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
-            shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;return;
+            shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
+            // The compositor renders the next frame only after this swap retires, so retiring at the end of the copy serialized render and
+            // copy (int-243: about 4.4 ms render then about 3 ms copy per frame). Retire now: the presenter holds its own reference to this
+            // frame's memory, the previous frame's copy has finished (transferred held this one back), and the next swap still waits for
+            // the copy because transferred stays set until finishGpuSwap.
+            unsigned early=1;PE_parse_boot_argn("sheng-early-retire",&early,sizeof(early));
+            if(early==1 && retireSwap(request,true)) {
+                gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;
+            }
+            return;
         }
         IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
@@ -288,6 +389,14 @@ public:
         const OriginalLegacySwapRequest *request=gpuRequest;
         if(!request)return;
         gpuRequest=nullptr;
+        if(gpuRetired) {
+            // The swap retired when the client took it; its copy ending only releases the next frame. A failed copy loses this frame
+            // (the next one takes the CPU copy).
+            gpuRetired=false;
+            if(status==0)native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
+            else {native_legacy_early_failures=native_legacy_early_failures+1;native_legacy_gpu_fallback_observed(status);gpuBypass=true;}
+            transferred=false;kickSwapQueue();return;
+        }
         if(status==0) {
             native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
             finishTransfer(request,true);return;
@@ -295,28 +404,27 @@ public:
         native_legacy_gpu_fallback_observed(status);
         transferred=false;gpuBypass=true;kickSwapQueue();
     }
-    // Separately gated retirement after a real scanout store, shared by copied and blank frames.
-    void finishTransfer(const OriginalLegacySwapRequest *request,bool force=false) {
+    // Hands the pending head to the unchanged family's completion. Leaves transferred alone: the callers decide when the next frame may go.
+    bool retireSwap(const OriginalLegacySwapRequest *request,bool force) {
         unsigned retire=0,cpuPresent=0;
         PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));
         PE_parse_boot_argn("offline-legacy-cpu-present",&cpuPresent,sizeof(cpuPresent));
-        if(retire==1 || cpuPresent==1 || force) {
-            // Only after the real copy and store barrier: select the actual
-            // pending head and let the unchanged family release it and wake
-            // waiters. This reports memory scanout completion, not a panel
-            // vblank or hardware fence. Producer completion must precede
-            // submission; this does not implement asynchronous GPU sync.
-            if(!activateOnlyPendingSwap(request))return;
-            removeValidated(request);
-            IOMobileFramebufferLegacy::completeCurrentSwap();
-            native_legacy_retirement_observed(this);
-            // The unchanged family has retired this generation and released
-            // its current reference. Permit the next independently validated
-            // single pending frame. Keep the latch set while completion can
-            // reenter this method, and whenever retirement remains disabled.
-            transferred=false;
-            kickSwapQueue();
-        }
+        if(!(retire==1 || cpuPresent==1 || force))return false;
+        if(!activateOnlyPendingSwap(request))return false;
+        removeValidated(request);
+        IOMobileFramebufferLegacy::completeCurrentSwap();
+        native_legacy_retirement_observed(this);
+        return true;
+    }
+    // Separately gated retirement after a real scanout store, shared by copied and blank frames.
+    void finishTransfer(const OriginalLegacySwapRequest *request,bool force=false) {
+        // Only after the real copy and store barrier: select the actual pending head and let the unchanged family release it and wake
+        // waiters. This reports memory scanout completion, not a panel vblank or hardware fence.
+        if(!retireSwap(request,force))return;
+        // The unchanged family has retired this generation and released its current reference. Permit the next independently validated
+        // single pending frame. Keep the latch set while completion can reenter this method, and whenever retirement remains disabled.
+        transferred=false;
+        kickSwapQueue();
     }
     IOReturn collectCompletionReports(uint32_t,void *,uint32_t *count,uint32_t) override {
         // The original completion helper passes null optional outputs and
