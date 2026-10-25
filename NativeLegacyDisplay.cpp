@@ -234,7 +234,6 @@ public:
         } while(false);
         baseBusy=0;
     }
-    void free() override {if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
     void stop(IOService *provider) override {
         stopVsync();
         transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
